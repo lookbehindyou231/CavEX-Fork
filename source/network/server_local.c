@@ -128,40 +128,57 @@ static void set_portal_block(struct server_local* s, w_coord_t x, w_coord_t y, w
 	server_world_set_block(&s->world, x, y, z,
 		(struct block_data) { .type = BLOCK_PORTAL, .metadata = metadata });
 	clin_rpc_send(&(struct client_rpc) {
-		.type = CRPC_BLOCK_UPDATE,
-		.payload.block_update.x = x,
-		.payload.block_update.y = y,
-		.payload.block_update.z = z,
-		.payload.block_update.block = (struct block_data) {
+		.type = CRPC_SET_BLOCK,
+		.payload.set_block.x = x,
+		.payload.set_block.y = y,
+		.payload.set_block.z = z,
+		.payload.set_block.block = (struct block_data) {
 			.type = BLOCK_PORTAL, .metadata = metadata },
 	});
 }
 
-/* NEW: try to fill a nether portal frame
-   axis=0: frame along X, axis=1: frame along Z */
+/* NEW: try to fill a nether portal frame starting at (x,y,z)
+   axis=0: frame along X axis (portal interior along X)
+   axis=1: frame along Z axis (portal interior along Z)
+   Returns true if a valid frame was found and filled. */
 static bool try_fill_portal(struct server_local* s, w_coord_t x, w_coord_t y, w_coord_t z, int axis) {
+	/* Portal interior is 2 wide, 3 tall.
+	   dx/dz is the direction along the portal face. */
 	w_coord_t dx = (axis == 0) ? 1 : 0;
 	w_coord_t dz = (axis == 1) ? 1 : 0;
 
+	/* Find bottom-left corner of the interior — scan down and to the left */
+	/* First find the bottom (scan down) */
 	while(y > 0 && get_block_type(s, x, y - 1, z) == BLOCK_AIR)
 		y--;
 
+	/* Find the left edge (scan in -dx/-dz direction) */
 	while(get_block_type(s, x - dx, y, z - dz) == BLOCK_AIR) {
 		x -= dx;
 		z -= dz;
 	}
 
+	/* Now check the frame:
+	   Bottom row: obsidian at (x-dx, y-1, z-dz), (x, y-1, z), (x+dx, y-1, z+dz), (x+2*dx, y-1, z+2*dz) — but interior is 2 wide
+	   So corners: left=(x-dx), right=(x+2*dx) for axis=0 */
+
+	/* Check bottom: obsidian under x,y and x+dx,y */
 	if(get_block_type(s, x,      y - 1, z     ) != BLOCK_OBSIDIAN) return false;
 	if(get_block_type(s, x + dx, y - 1, z + dz) != BLOCK_OBSIDIAN) return false;
+
+	/* Check top: obsidian above x,y+3 and x+dx,y+3 */
 	if(get_block_type(s, x,      y + 3, z     ) != BLOCK_OBSIDIAN) return false;
 	if(get_block_type(s, x + dx, y + 3, z + dz) != BLOCK_OBSIDIAN) return false;
 
+	/* Check left column: obsidian at (x-dx, y..y+2) */
 	for(int i = 0; i < 3; i++)
 		if(get_block_type(s, x - dx, y + i, z - dz) != BLOCK_OBSIDIAN) return false;
 
+	/* Check right column: obsidian at (x+2*dx, y..y+2) */
 	for(int i = 0; i < 3; i++)
 		if(get_block_type(s, x + 2 * dx, y + i, z + 2 * dz) != BLOCK_OBSIDIAN) return false;
 
+	/* Check interior is air or fire */
 	for(int i = 0; i < 2; i++) {
 		for(int j = 0; j < 3; j++) {
 			uint8_t t = get_block_type(s, x + i * dx, y + j, z + i * dz);
@@ -169,6 +186,8 @@ static bool try_fill_portal(struct server_local* s, w_coord_t x, w_coord_t y, w_
 		}
 	}
 
+	/* Fill interior with portal blocks */
+	/* metadata 1 = X-axis portal, metadata 2 = Z-axis portal (matches Minecraft) */
 	uint8_t meta = (axis == 0) ? 1 : 2;
 	for(int i = 0; i < 2; i++)
 		for(int j = 0; j < 3; j++)
@@ -179,6 +198,7 @@ static bool try_fill_portal(struct server_local* s, w_coord_t x, w_coord_t y, w_
 
 /* NEW: attempt to ignite a portal at the given fire position */
 static void try_ignite_portal(struct server_local* s, w_coord_t x, w_coord_t y, w_coord_t z) {
+	/* Try both axes */
 	try_fill_portal(s, x, y, z, 0) || try_fill_portal(s, x, y, z, 1);
 }
 
@@ -309,8 +329,9 @@ static void server_local_process(struct server_rpc* call, void* user) {
 					inventory_get_hotbar_item(&s->player.inventory, &it_data);
 					struct item* it = item_get(&it_data);
 
-					/* NEW: flint and steel places fire */
+					/* NEW: flint and steel places fire on top of blocks */
 					if(it && it_data.id == ITEM_FLINT_STEEL) {
+						/* Only place fire on top face, and only if target is air */
 						if(call->payload.block_place.side == SIDE_TOP
 						   && blk_where.type == BLOCK_AIR) {
 							w_coord_t fx = call->payload.block_place.x + x;
@@ -321,19 +342,22 @@ static void server_local_process(struct server_rpc* call, void* user) {
 								(struct block_data) { .type = BLOCK_FIRE, .metadata = 0 });
 
 							clin_rpc_send(&(struct client_rpc) {
-								.type = CRPC_BLOCK_UPDATE,
-								.payload.block_update.x = fx,
-								.payload.block_update.y = fy,
-								.payload.block_update.z = fz,
-								.payload.block_update.block = (struct block_data) {
+								.type = CRPC_SET_BLOCK,
+								.payload.set_block.x = fx,
+								.payload.set_block.y = fy,
+								.payload.set_block.z = fz,
+								.payload.set_block.block = (struct block_data) {
 									.type = BLOCK_FIRE, .metadata = 0 },
 							});
 
+							/* Check if this fire completes a portal frame */
 							try_ignite_portal(s, fx, fy, fz);
 
+							/* Damage the flint and steel */
 							size_t slot = inventory_get_hotbar(&s->player.inventory);
 							it_data.durability++;
 							if(it_data.durability >= 65) {
+								/* Flint and steel broke */
 								inventory_consume(&s->player.inventory,
 												  slot + INVENTORY_SLOT_HOTBAR);
 							} else {
@@ -378,6 +402,7 @@ static void server_local_process(struct server_rpc* call, void* user) {
 			}
 			break;
 		case SRPC_UNLOAD_WORLD:
+			// save chunks here, then destroy all
 			clin_rpc_send(&(struct client_rpc) {
 				.type = CRPC_WORLD_RESET,
 				.payload.world_reset.dimension = s->player.dimension,
@@ -484,6 +509,7 @@ static void server_local_update(struct server_local* s) {
 	w_coord_t cx, cz;
 	if(server_world_furthest_chunk(&s->world, MAX_VIEW_DISTANCE, px, pz, &cx,
 								   &cz)) {
+		// unload just one chunk
 		server_world_save_chunk(&s->world, true, cx, cz);
 		clin_rpc_send(&(struct client_rpc) {
 			.type = CRPC_UNLOAD_CHUNK,
@@ -492,6 +518,7 @@ static void server_local_update(struct server_local* s) {
 		});
 	}
 
+	// iterate over all chunks that should be loaded
 	bool c_nearest = false;
 	w_coord_t c_nearest_x, c_nearest_z;
 	w_coord_t c_nearest_dist2 = INT_MAX;
@@ -511,6 +538,7 @@ static void server_local_update(struct server_local* s) {
 		}
 	}
 
+	// load just one chunk
 	struct server_chunk* sc;
 	if(c_nearest
 	   && server_world_load_chunk(&s->world, c_nearest_x, c_nearest_z, &sc)) {
